@@ -15,6 +15,7 @@ use crate::stats::*;
 use fnv::FnvHashMap;
 #[cfg(feature = "compat")]
 use fnv::FnvHashSet;
+use futures::future::BoxFuture;
 use futures::{
     channel::mpsc,
     stream::{Stream, StreamExt},
@@ -59,17 +60,18 @@ pub enum BitswapEvent {
 }
 
 /// Trait implemented by a block store.
+#[async_trait::async_trait]
 pub trait BitswapStore: Send + Sync + 'static {
     /// The store params.
     type Params: StoreParams;
     /// A have query needs to know if the block store contains the block.
-    fn contains(&mut self, cid: &Cid) -> Result<bool>;
+    async fn contains(&mut self, cid: &Cid) -> Result<bool>;
     /// A block query needs to retrieve the block from the store.
-    fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>>;
+    async fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>>;
     /// A block response needs to insert the block into the store.
-    fn insert(&mut self, block: &Block<Self::Params>) -> Result<()>;
+    async fn insert(&mut self, block: &Block<Self::Params>) -> Result<()>;
     /// A sync query needs a list of missing blocks to make progress.
-    fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>>;
+    async fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>>;
 }
 
 /// Bitswap configuration.
@@ -129,13 +131,17 @@ pub struct Bitswap<P: StoreParams> {
 
 impl<P: StoreParams> Bitswap<P> {
     /// Creates a new `Bitswap` behaviour.
-    pub fn new<S: BitswapStore<Params = P>>(config: BitswapConfig, store: S) -> Self {
+    pub fn new<S: BitswapStore<Params = P>>(
+        config: BitswapConfig,
+        store: S,
+        executor: Box<dyn FnOnce(BoxFuture<'static, ()>)>,
+    ) -> Self {
         let mut rr_config = RequestResponseConfig::default();
         rr_config.set_connection_keep_alive(config.connection_keep_alive);
         rr_config.set_request_timeout(config.request_timeout);
         let protocols = std::iter::once((LIBP2P_BITSWAP_PROTOCOL, ProtocolSupport::Full));
         let inner = RequestResponse::new(protocols, rr_config);
-        let (db_tx, db_rx) = start_db_thread(store);
+        let (db_tx, db_rx) = start_db_thread(store, executor);
         Self {
             inner,
             query_manager: Default::default(),
@@ -214,20 +220,21 @@ enum DbResponse {
 
 fn start_db_thread<S: BitswapStore>(
     mut store: S,
+    executor: Box<dyn FnOnce(BoxFuture<'static, ()>)>,
 ) -> (
     mpsc::UnboundedSender<DbRequest<S::Params>>,
     mpsc::UnboundedReceiver<DbResponse>,
 ) {
     let (tx, requests) = mpsc::unbounded();
     let (responses, rx) = mpsc::unbounded();
-    std::thread::spawn(move || {
+    executor(Box::pin(async move {
         let mut requests: mpsc::UnboundedReceiver<DbRequest<S::Params>> = requests;
-        while let Some(request) = futures::executor::block_on(requests.next()) {
+        while let Some(request) = requests.next().await {
             match request {
                 DbRequest::Bitswap(channel, request) => {
                     let response = match request.ty {
                         RequestType::Have => {
-                            let have = store.contains(&request.cid).ok().unwrap_or_default();
+                            let have = store.contains(&request.cid).await.ok().unwrap_or_default();
                             if have {
                                 RESPONSES_TOTAL.with_label_values(&["have"]).inc();
                             } else {
@@ -237,7 +244,7 @@ fn start_db_thread<S: BitswapStore>(
                             BitswapResponse::Have(have)
                         }
                         RequestType::Block => {
-                            let block = store.get(&request.cid).ok().unwrap_or_default();
+                            let block = store.get(&request.cid).await.ok().unwrap_or_default();
                             if let Some(data) = block {
                                 RESPONSES_TOTAL.with_label_values(&["block"]).inc();
                                 SENT_BLOCK_BYTES.inc_by(data.len() as u64);
@@ -255,19 +262,19 @@ fn start_db_thread<S: BitswapStore>(
                         .ok();
                 }
                 DbRequest::Insert(block) => {
-                    if let Err(err) = store.insert(&block) {
+                    if let Err(err) = store.insert(&block).await {
                         tracing::error!("error inserting blocks {}", err);
                     }
                 }
                 DbRequest::MissingBlocks(id, cid) => {
-                    let res = store.missing_blocks(&cid);
+                    let res = store.missing_blocks(&cid).await;
                     responses
                         .unbounded_send(DbResponse::MissingBlocks(id, res))
                         .ok();
                 }
             }
         }
-    });
+    }));
     (tx, rx)
 }
 
@@ -787,26 +794,27 @@ mod tests {
     #[derive(Clone, Default)]
     struct Store(Arc<Mutex<FnvHashMap<Cid, Vec<u8>>>>);
 
+    #[async_trait::async_trait]
     impl BitswapStore for Store {
         type Params = DefaultParams;
-        fn contains(&mut self, cid: &Cid) -> Result<bool> {
+        async fn contains(&mut self, cid: &Cid) -> Result<bool> {
             Ok(self.0.lock().unwrap().contains_key(cid))
         }
-        fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>> {
+        async fn get(&mut self, cid: &Cid) -> Result<Option<Vec<u8>>> {
             Ok(self.0.lock().unwrap().get(cid).cloned())
         }
-        fn insert(&mut self, block: &Block<Self::Params>) -> Result<()> {
+        async fn insert(&mut self, block: &Block<Self::Params>) -> Result<()> {
             self.0
                 .lock()
                 .unwrap()
                 .insert(*block.cid(), block.data().to_vec());
             Ok(())
         }
-        fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>> {
+        async fn missing_blocks(&mut self, cid: &Cid) -> Result<Vec<Cid>> {
             let mut stack = vec![*cid];
             let mut missing = vec![];
             while let Some(cid) = stack.pop() {
-                if let Some(data) = self.get(&cid)? {
+                if let Some(data) = self.get(&cid).await? {
                     let block = Block::<Self::Params>::new_unchecked(cid, data);
                     block.references(&mut stack)?;
                 } else {
@@ -830,7 +838,13 @@ mod tests {
             let store = Store::default();
             let mut swarm = SwarmBuilder::with_async_std_executor(
                 trans,
-                Bitswap::new(BitswapConfig::new(), store.clone()),
+                Bitswap::new(
+                    BitswapConfig::new(),
+                    store.clone(),
+                    Box::new(|t| {
+                        async_std::task::spawn(t);
+                    }),
+                ),
                 peer_id,
             )
             .build();
