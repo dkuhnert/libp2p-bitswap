@@ -10,9 +10,6 @@ repository = "https://github.com/ipfs-rust/libp2p-bitswap"
 [features]
 compat = ["quick-protobuf"]
 
-[build-dependencies]
-prost-build = { version = "0.11", optional = true }
-
 [dependencies]
 async-trait = "0.1.52"
 fnv = "1.0.7"
@@ -24,7 +21,6 @@ prometheus = "0.13.0"
 thiserror = "1.0.30"
 tracing = "0.1.29"
 unsigned-varint = { version = "0.7.1", features = ["futures", "std"] }
-
 quick-protobuf = { version = "0.8.1", optional = true }
 
 [dev-dependencies]
