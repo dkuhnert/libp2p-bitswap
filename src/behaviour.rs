@@ -37,9 +37,10 @@ use libp2p::{
     request_response::{
         Behaviour as RequestResponse, Config as RequestResponseConfig,
         Event as RequestResponseEvent, InboundFailure, Message as RequestResponseMessage,
-        OutboundFailure, ProtocolSupport, RequestId, ResponseChannel,
+        OutboundFailure, ProtocolSupport, ResponseChannel,
+        InboundRequestId, OutboundRequestId,
     },
-    swarm::{ConnectionHandler, NetworkBehaviour, PollParameters, ToSwarm},
+    swarm::{ConnectionHandler, NetworkBehaviour, ToSwarm},
 };
 use prometheus::Registry;
 use std::{pin::Pin, time::Duration};
@@ -77,8 +78,8 @@ pub trait BitswapStore: Send + Sync + 'static {
 pub struct BitswapConfig {
     /// Timeout of a request.
     pub request_timeout: Duration,
-    /// Time a connection is kept alive.
-    pub connection_keep_alive: Duration,
+    /// The upper bound for the number of concurrent inbound + outbound streams.
+    pub max_concurrent_streams: usize,
 }
 
 impl BitswapConfig {
@@ -86,7 +87,7 @@ impl BitswapConfig {
     pub fn new() -> Self {
         Self {
             request_timeout: Duration::from_secs(10),
-            connection_keep_alive: Duration::from_secs(10),
+            max_concurrent_streams: 100,
         }
     }
 }
@@ -99,7 +100,7 @@ impl Default for BitswapConfig {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum BitswapId {
-    Bitswap(RequestId),
+    Bitswap(OutboundRequestId),
     #[cfg(feature = "compat")]
     Compat(Cid),
 }
@@ -130,9 +131,9 @@ pub struct Bitswap<P: StoreParams> {
 impl<P: StoreParams> Bitswap<P> {
     /// Creates a new `Bitswap` behaviour.
     pub fn new<S: BitswapStore<Params = P>>(config: BitswapConfig, store: S) -> Self {
-        let mut rr_config = RequestResponseConfig::default();
-        rr_config.set_connection_keep_alive(config.connection_keep_alive);
-        rr_config.set_request_timeout(config.request_timeout);
+        let rr_config = RequestResponseConfig::default()
+            .with_max_concurrent_streams(config.max_concurrent_streams)
+            .with_request_timeout(config.request_timeout);
         let protocols = std::iter::once((LIBP2P_BITSWAP_PROTOCOL, ProtocolSupport::Full));
         let inner = RequestResponse::new(protocols, rr_config);
         let (db_tx, db_rx) = start_db_thread(store);
@@ -310,7 +311,7 @@ impl<P: StoreParams> Bitswap<P> {
     fn inject_outbound_failure(
         &mut self,
         peer: &PeerId,
-        request_id: RequestId,
+        request_id: OutboundRequestId,
         error: &OutboundFailure,
     ) {
         tracing::debug!(
@@ -336,13 +337,18 @@ impl<P: StoreParams> Bitswap<P> {
                     .with_label_values(&["unsupported_protocols"])
                     .inc();
             }
+            OutboundFailure::Io(_) => {
+                OUTBOUND_FAILURE
+                    .with_label_values(&["io"])
+                    .inc();
+            },
         }
     }
 
     fn inject_inbound_failure(
         &mut self,
         peer: &PeerId,
-        request_id: RequestId,
+        request_id: InboundRequestId,
         error: &InboundFailure,
     ) {
         tracing::error!(
@@ -370,6 +376,11 @@ impl<P: StoreParams> Bitswap<P> {
                     .with_label_values(&["response_omission"])
                     .inc();
             }
+            InboundFailure::Io(_) => {
+                INBOUND_FAILURE
+                    .with_label_values(&["io"])
+                    .inc();
+            },
         }
     }
 }
@@ -444,7 +455,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         )
     }
 
-    fn on_swarm_event(&mut self, event: FromSwarm<Self::ConnectionHandler>) {
+    fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
             FromSwarm::ConnectionEstablished(ev) => self
                 .inner
@@ -453,7 +464,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                 peer_id,
                 connection_id,
                 endpoint,
-                handler,
                 remaining_established,
             }) => {
                 #[cfg(feature = "compat")]
@@ -467,7 +477,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         peer_id,
                         connection_id,
                         endpoint,
-                        handler,
                         remaining_established,
                     }));
             }
@@ -516,6 +525,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             FromSwarm::ExternalAddrExpired(ev) => self
                 .inner
                 .on_swarm_event(FromSwarm::ExternalAddrExpired(ev)),
+            _ => {},
         }
     }
 
@@ -551,7 +561,6 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
     fn poll(
         &mut self,
         cx: &mut Context,
-        pp: &mut impl PollParameters,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         let mut exit = false;
         while !exit {
@@ -629,7 +638,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                     }
                 }
             }
-            while let Poll::Ready(event) = self.inner.poll(cx, pp) {
+            while let Poll::Ready(event) = self.inner.poll(cx) {
                 exit = false;
                 let event = match event {
                     ToSwarm::GenerateEvent(event) => event,
@@ -673,7 +682,10 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             peer_id,
                             connection,
                         });
-                    }
+                    },
+                    _ => {
+                        continue
+                    },
                 };
                 match event {
                     RequestResponseEvent::Message { peer, message } => match message {
@@ -746,16 +758,10 @@ mod tests {
     use libipld::ipld::Ipld;
     use libipld::multihash::Code;
     use libipld::store::DefaultParams;
-    use libp2p::core::muxing::StreamMuxerBox;
-    use libp2p::core::transport::Boxed;
-    use libp2p::identity;
-    use libp2p::noise::Config;
-    use libp2p::swarm::{SwarmBuilder, SwarmEvent};
-    use libp2p::tcp::{self, async_io};
-    use libp2p::yamux::Config as YamuxConfig;
-    use libp2p::{PeerId, Swarm, Transport};
+    use libp2p::{tcp, noise, yamux, SwarmBuilder};
+    use libp2p::swarm::SwarmEvent;
+    use libp2p::{PeerId, Swarm};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
     use tracing_subscriber::fmt::TestWriter;
 
     fn tracing_try_init() {
@@ -764,20 +770,6 @@ mod tests {
             .with_writer(TestWriter::new())
             .try_init()
             .ok();
-    }
-
-    fn mk_transport() -> (PeerId, Boxed<(PeerId, StreamMuxerBox)>) {
-        let id_key = identity::Keypair::generate_ed25519();
-        let peer_id = id_key.public().to_peer_id();
-        let noise = Config::new(&id_key).unwrap();
-
-        let transport = async_io::Transport::new(tcp::Config::new().nodelay(true))
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(noise)
-            .multiplex(YamuxConfig::default())
-            .timeout(Duration::from_secs(20))
-            .boxed();
-        (peer_id, transport)
     }
 
     fn create_block(ipld: Ipld) -> Block<DefaultParams> {
@@ -826,19 +818,18 @@ mod tests {
 
     impl Peer {
         fn new() -> Self {
-            let (peer_id, trans) = mk_transport();
             let store = Store::default();
-            let mut swarm = SwarmBuilder::with_async_std_executor(
-                trans,
-                Bitswap::new(BitswapConfig::new(), store.clone()),
-                peer_id,
-            )
-            .build();
-            Swarm::listen_on(&mut swarm, "/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+            let mut swarm = SwarmBuilder::with_new_identity()
+                .with_async_std()
+                .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default).unwrap()
+                .with_behaviour(|_| Bitswap::new(BitswapConfig::new(), store.clone())).unwrap()
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(20)))
+                .build();
+            swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
             while swarm.next().now_or_never().is_some() {}
             let addr = Swarm::listeners(&swarm).next().unwrap().clone();
             Self {
-                peer_id,
+                peer_id: swarm.local_peer_id().clone(),
                 addr,
                 store,
                 swarm,
