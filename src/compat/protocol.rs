@@ -1,9 +1,8 @@
 use crate::compat::{other, CompatMessage};
-use futures::future::BoxFuture;
-use futures::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use libp2p::StreamProtocol;
+use futures::{SinkExt, StreamExt, io::{AsyncRead, AsyncWrite, AsyncWriteExt}, future::BoxFuture};
+use libp2p::{StreamProtocol, core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo}};
 use std::{io, iter};
+use asynchronous_codec::{FramedRead, FramedWrite, LengthCodec};
 
 // 2MB Block Size according to the specs at https://github.com/ipfs/specs/blob/main/BITSWAP.md
 const MAX_BUF_SIZE: usize = 2_097_152;
@@ -16,7 +15,7 @@ impl UpgradeInfo for CompatProtocol {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+        iter::once(StreamProtocol::new("/ipfs/bitswap/1.3.0"))
     }
 }
 
@@ -31,12 +30,17 @@ where
     fn upgrade_inbound(self, mut socket: TSocket, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
             tracing::trace!("upgrading inbound");
-            let packet = upgrade::read_length_prefixed(&mut socket, MAX_BUF_SIZE)
+            let packet = FramedRead::new(&mut socket, LengthCodec {})
+                .next()
                 .await
+                .ok_or(Into::<io::Error>::into(io::ErrorKind::UnexpectedEof))
                 .map_err(|err| {
                     tracing::debug!(%err, "inbound upgrade error");
                     other(err)
-                })?;
+                })??;
+            if packet.len() > MAX_BUF_SIZE {
+                return Err(io::ErrorKind::InvalidData.into())
+            }
             socket.close().await?;
             tracing::trace!("inbound upgrade done, closing");
             let message = CompatMessage::from_bytes(&packet).map_err(|e| {
@@ -69,7 +73,9 @@ where
     fn upgrade_outbound(self, mut socket: TSocket, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
             let bytes = self.to_bytes()?;
-            upgrade::write_length_prefixed(&mut socket, bytes).await?;
+            let mut framed = FramedWrite::new(&mut socket, LengthCodec {});
+            framed.send(bytes.into()).await?;
+            framed.flush().await?;
             socket.close().await?;
             Ok(())
         })

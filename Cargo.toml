@@ -8,10 +8,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ipfs-rust/libp2p-bitswap"
 
 [features]
-compat = ["quick-protobuf"]
+compat = ["quick-protobuf", "asynchronous-codec"]
 
 [dependencies]
 async-trait = "0.1.52"
+asynchronous-codec = { version = "0.7.0", optional = true }
 fnv = "1.0.7"
 futures = "0.3.19"
 lazy_static = "1.4.0"

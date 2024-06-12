@@ -549,6 +549,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         match event {
             Either::Left(event) => self.inner.on_connection_handler_event(peer_id, conn, event),
             Either::Right(msg) => {
+                if let Ok(msg) = msg {
                 for msg in msg.0 {
                     match msg {
                         CompatMessage::Request(req) => {
@@ -558,6 +559,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         CompatMessage::Response(cid, res) => {
                             tracing::trace!("received compat response");
                             self.inject_response(BitswapId::Compat(cid), peer_id, res);
+                            }
                         }
                     }
                 }

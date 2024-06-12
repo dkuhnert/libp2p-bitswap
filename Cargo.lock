@@ -1498,6 +1498,7 @@ version = "0.25.0"
 dependencies = [
  "async-std",
  "async-trait",
+ "asynchronous-codec",
  "env_logger 0.9.3",
  "fnv",
  "futures",
