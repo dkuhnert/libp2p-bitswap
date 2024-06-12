@@ -18,10 +18,10 @@ lazy_static = "1.4.0"
 libipld = { version = "0.16.0", default-features = false }
 libp2p = { version = "0.53", features = ["request-response"] }
 prometheus = "0.13.0"
+quick-protobuf = { version = "0.8.1", optional = true }
 thiserror = "1.0.30"
 tracing = "0.1.29"
 unsigned-varint = { version = "0.7.1", features = ["futures", "std"] }
-quick-protobuf = { version = "0.8.1", optional = true }
 
 [dev-dependencies]
 async-std = { version = "1.10.0", features = ["attributes"] }
@@ -30,3 +30,6 @@ libipld = { version = "0.16.0", default-features = false, features = ["dag-cbor"
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "rsa", "ed25519", "async-std"] }
 multihash = { version = "0.18.0", default-features = false, features = ["blake3", "sha2"] }
 tracing-subscriber = { version = "0.3.5", features = ["env-filter","tracing-log"] }
+
+[build-dependencies]
+pb-rs = "0.9.1"
