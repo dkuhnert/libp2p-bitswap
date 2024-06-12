@@ -1,9 +1,9 @@
-use crate::stats::{REQUESTS_TOTAL, REQUEST_DURATION_SECONDS};
+use crate::{stats::{REQUESTS_TOTAL, REQUEST_DURATION_SECONDS}, Token};
 use fnv::{FnvHashMap, FnvHashSet};
 use libipld::Cid;
 use libp2p::PeerId;
 use prometheus::HistogramTimer;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem::take};
 
 /// Query id.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -82,6 +82,8 @@ pub struct Header {
     pub timer: HistogramTimer,
     /// Type.
     pub label: &'static str,
+    /// Tokens.
+    pub tokens: Vec<Token>,
 }
 
 impl Drop for Header {
@@ -141,6 +143,7 @@ impl QueryManager {
         cid: Cid,
         req: Request,
         label: &'static str,
+        tokens: Vec<Token>,
     ) -> QueryId {
         let timer = REQUEST_DURATION_SECONDS
             .with_label_values(&[label])
@@ -155,6 +158,7 @@ impl QueryManager {
                 cid,
                 timer,
                 label,
+                tokens,
             },
             state: State::None,
         };
@@ -165,29 +169,31 @@ impl QueryManager {
     }
 
     /// Starts a new have query to ask a peer if it has a block.
-    fn have(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid) -> QueryId {
-        self.start_query(root, Some(parent), cid, Request::Have(peer_id, cid), "have")
+    fn have(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid, tokens: Vec<Token>) -> QueryId {
+        self.start_query(root, Some(parent), cid, Request::Have(peer_id, cid), "have", tokens)
     }
 
     /// Starts a new block query to request a block from a peer.
-    fn block(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid) -> QueryId {
+    fn block(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid, tokens: Vec<Token>) -> QueryId {
         self.start_query(
             root,
             Some(parent),
             cid,
             Request::Block(peer_id, cid),
             "block",
+            tokens,
         )
     }
 
     /// Starts a query to determine the missing blocks of a dag.
-    fn missing_blocks(&mut self, parent: QueryId, cid: Cid) -> QueryId {
+    fn missing_blocks(&mut self, parent: QueryId, cid: Cid, tokens: Vec<Token>) -> QueryId {
         self.start_query(
             parent,
             Some(parent),
             cid,
             Request::MissingBlocks(cid),
             "missing-blocks",
+            tokens,
         )
     }
 
@@ -197,6 +203,7 @@ impl QueryManager {
         parent: Option<QueryId>,
         cid: Cid,
         providers: impl Iterator<Item = PeerId>,
+        tokens: Vec<Token>,
     ) -> QueryId {
         let timer = REQUEST_DURATION_SECONDS
             .with_label_values(&["get"])
@@ -208,9 +215,9 @@ impl QueryManager {
         let mut state = GetState::default();
         for peer in providers {
             if state.block.is_none() {
-                state.block = Some(self.block(root, id, peer, cid));
+                state.block = Some(self.block(root, id, peer, cid, tokens.clone()));
             } else {
-                state.have.insert(self.have(root, id, peer, cid));
+                state.have.insert(self.have(root, id, peer, cid, tokens.clone()));
             }
         }
         assert!(state.block.is_some());
@@ -222,6 +229,7 @@ impl QueryManager {
                 cid,
                 timer,
                 label: "get",
+                tokens,
             },
             state: State::Get(state),
         };
@@ -236,6 +244,7 @@ impl QueryManager {
         cid: Cid,
         providers: Vec<PeerId>,
         missing: impl Iterator<Item = Cid>,
+        tokens: Vec<Token>,
     ) -> QueryId {
         let timer = REQUEST_DURATION_SECONDS
             .with_label_values(&["sync"])
@@ -247,10 +256,10 @@ impl QueryManager {
         for cid in missing {
             state
                 .missing
-                .insert(self.get(Some(id), cid, providers.iter().copied()));
+                .insert(self.get(Some(id), cid, providers.iter().copied(), tokens.clone()));
         }
         if state.missing.is_empty() {
-            state.children.insert(self.missing_blocks(id, cid));
+            state.children.insert(self.missing_blocks(id, cid, tokens.clone()));
         }
         state.providers = providers;
         let query = Query {
@@ -261,6 +270,7 @@ impl QueryManager {
                 cid,
                 timer,
                 label: "sync",
+                tokens,
             },
             state: State::Sync(state),
         };
@@ -369,7 +379,7 @@ impl QueryManager {
     /// a block. If there isn't an in progress block query a new block query will be
     /// started. If no block query can be started either a provider query is started or
     /// the get query is marked as complete with a block-not-found error.
-    fn recv_have(&mut self, query: Header, peer_id: PeerId, have: bool) {
+    fn recv_have(&mut self, mut query: Header, peer_id: PeerId, have: bool) {
         self.get_query(query.parent.unwrap(), |mgr, parent, mut state| {
             state.have.remove(&query.id);
             if state.block == Some(query.id) {
@@ -384,6 +394,7 @@ impl QueryManager {
                     parent.id,
                     state.providers.pop().unwrap(),
                     query.cid,
+                    take(&mut query.tokens),
                 ));
             }
             if state.have.is_empty() && state.block.is_none() && state.providers.is_empty() {
@@ -415,7 +426,7 @@ impl QueryManager {
     ///
     /// Starts a get query for each missing block. If there are no in progress queries
     /// the sync query is marked as complete.
-    fn recv_missing_blocks(&mut self, query: Header, missing: Vec<Cid>) {
+    fn recv_missing_blocks(&mut self, mut query: Header, missing: Vec<Cid>) {
         let mut num_missing = 0;
         let num_missing_ref = &mut num_missing;
         self.sync_query(query.parent.unwrap(), |mgr, parent, mut state| {
@@ -425,6 +436,7 @@ impl QueryManager {
                     Some(parent.root),
                     cid,
                     state.providers.iter().copied(),
+                    take(&mut query.tokens),
                 ));
             }
             *num_missing_ref = state.missing.len();
@@ -444,7 +456,7 @@ impl QueryManager {
     ///
     /// If it is part of a sync query a new missing blocks query is started. Otherwise
     /// the get query emits a `complete` event.
-    fn recv_get(&mut self, query: Header, res: Result<(), Cid>) {
+    fn recv_get(&mut self, mut query: Header, res: Result<(), Cid>) {
         if let Some(id) = query.parent {
             self.sync_query(id, |mgr, parent, mut state| {
                 state.missing.remove(&query.id);
@@ -453,7 +465,7 @@ impl QueryManager {
                 } else {
                     state
                         .children
-                        .insert(mgr.missing_blocks(parent.root, query.cid));
+                        .insert(mgr.missing_blocks(parent.root, query.cid, take(&mut query.tokens)));
                     Transition::Next(state)
                 }
             });
@@ -546,7 +558,7 @@ mod tests {
         let initial_set = gen_peers(3);
         let cid = Cid::default();
 
-        let id = mgr.get(None, cid, initial_set.iter().copied());
+        let id = mgr.get(None, cid, initial_set.iter().copied(), vec![]);
 
         let id1 = assert_request(mgr.next(), Request::Block(initial_set[0], cid));
         let id2 = assert_request(mgr.next(), Request::Have(initial_set[1], cid));
@@ -565,7 +577,7 @@ mod tests {
         let initial_set = gen_peers(3);
         let cid = Cid::default();
 
-        let id = mgr.get(None, cid, initial_set.iter().copied());
+        let id = mgr.get(None, cid, initial_set.iter().copied(), vec![]);
 
         let id1 = assert_request(mgr.next(), Request::Block(initial_set[0], cid));
         let id2 = assert_request(mgr.next(), Request::Have(initial_set[1], cid));
@@ -584,7 +596,7 @@ mod tests {
         let initial_set = gen_peers(3);
         let cid = Cid::default();
 
-        let id = mgr.get(None, cid, initial_set.iter().copied());
+        let id = mgr.get(None, cid, initial_set.iter().copied(), vec![]);
 
         let id1 = assert_request(mgr.next(), Request::Block(initial_set[0], cid));
         let id2 = assert_request(mgr.next(), Request::Have(initial_set[1], cid));
@@ -606,7 +618,7 @@ mod tests {
         let initial_set = gen_peers(3);
         let cid = Cid::default();
 
-        let id = mgr.get(None, cid, initial_set.iter().copied());
+        let id = mgr.get(None, cid, initial_set.iter().copied(), vec![]);
 
         let id1 = assert_request(mgr.next(), Request::Block(initial_set[0], cid));
         let id2 = assert_request(mgr.next(), Request::Have(initial_set[1], cid));
@@ -632,7 +644,7 @@ mod tests {
         let providers = gen_peers(3);
         let cid = Cid::default();
 
-        let id = mgr.sync(cid, providers.clone(), std::iter::once(cid));
+        let id = mgr.sync(cid, providers.clone(), std::iter::once(cid), vec![]);
 
         let id1 = assert_request(mgr.next(), Request::Block(providers[0], cid));
         let id2 = assert_request(mgr.next(), Request::Have(providers[1], cid));
@@ -653,7 +665,7 @@ mod tests {
         tracing_try_init();
         let mut mgr = QueryManager::default();
         let cid = Cid::default();
-        let id = mgr.sync(cid, vec![], std::iter::empty());
+        let id = mgr.sync(cid, vec![], std::iter::empty(), vec![]);
         let id1 = assert_request(mgr.next(), Request::MissingBlocks(cid));
         mgr.inject_response(id1, Response::MissingBlocks(vec![]));
         assert_complete(mgr.next(), id, Ok(()));

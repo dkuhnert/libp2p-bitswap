@@ -16,6 +16,7 @@ message Message {
 			bool cancel = 3;		// whether this revokes an entry
       WantType wantType = 4; // Note: defaults to enum 0, ie Block
       bool sendDontHave = 5; // Note: defaults to false
+      repeated int32 tokens = 7; // the indices of the tokens in the token list
 		}
 
     repeated Entry entries = 1;	// a list of wantlist entries
@@ -25,6 +26,7 @@ message Message {
   message Block {
     bytes prefix = 1;		// CID prefix (cid version, multicodec and multihash prefix (type + length)
     bytes data = 2;
+    repeated int32 tokens = 4; // the indices of the tokens in the token list
   }
 
   enum BlockPresenceType {
@@ -34,6 +36,7 @@ message Message {
   message BlockPresence {
     bytes cid = 1;
     BlockPresenceType type = 2;
+    repeated int32 tokens = 4; // the indices of the tokens in the token list
   }
 
   Wantlist wantlist = 1;
@@ -41,4 +44,5 @@ message Message {
   repeated Block payload = 3;		// used to send Blocks in bitswap 1.1.0
   repeated BlockPresence blockPresences = 4;
   int32 pendingBytes = 5;
+  repeated bytes tokens = 6; // Each token is of the form <multicode><token-data> where the multicode identifies what the data is for
 }

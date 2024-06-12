@@ -9,6 +9,8 @@ mod compat;
 mod protocol;
 mod query;
 mod stats;
+mod token;
 
 pub use crate::behaviour::{Bitswap, BitswapConfig, BitswapEvent, BitswapStore, Channel};
 pub use crate::query::QueryId;
+pub use token::Token;

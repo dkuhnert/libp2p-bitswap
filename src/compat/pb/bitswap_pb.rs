@@ -22,6 +22,7 @@ pub struct Message<'a> {
     pub payload: Vec<bitswap_pb::mod_Message::Block<'a>>,
     pub blockPresences: Vec<bitswap_pb::mod_Message::BlockPresence<'a>>,
     pub pendingBytes: i32,
+    pub tokens: Vec<Cow<'a, [u8]>>,
 }
 
 impl<'a> MessageRead<'a> for Message<'a> {
@@ -34,6 +35,7 @@ impl<'a> MessageRead<'a> for Message<'a> {
                 Ok(26) => msg.payload.push(r.read_message::<bitswap_pb::mod_Message::Block>(bytes)?),
                 Ok(34) => msg.blockPresences.push(r.read_message::<bitswap_pb::mod_Message::BlockPresence>(bytes)?),
                 Ok(40) => msg.pendingBytes = r.read_int32(bytes)?,
+                Ok(50) => msg.tokens.push(r.read_bytes(bytes).map(Cow::Borrowed)?),
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -50,6 +52,7 @@ impl<'a> MessageWrite for Message<'a> {
         + self.payload.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
         + self.blockPresences.iter().map(|s| 1 + sizeof_len((s).get_size())).sum::<usize>()
         + if self.pendingBytes == 0i32 { 0 } else { 1 + sizeof_varint(*(&self.pendingBytes) as u64) }
+        + self.tokens.iter().map(|s| 1 + sizeof_len((s).len())).sum::<usize>()
     }
 
     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
@@ -58,6 +61,7 @@ impl<'a> MessageWrite for Message<'a> {
         for s in &self.payload { w.write_with_tag(26, |w| w.write_message(s))?; }
         for s in &self.blockPresences { w.write_with_tag(34, |w| w.write_message(s))?; }
         if self.pendingBytes != 0i32 { w.write_with_tag(40, |w| w.write_int32(*&self.pendingBytes))?; }
+        for s in &self.tokens { w.write_with_tag(50, |w| w.write_bytes(&**s))?; }
         Ok(())
     }
 }
@@ -116,6 +120,7 @@ pub struct Entry<'a> {
     pub cancel: bool,
     pub wantType: bitswap_pb::mod_Message::mod_Wantlist::WantType,
     pub sendDontHave: bool,
+    pub tokens: Vec<i32>,
 }
 
 impl<'a> MessageRead<'a> for Entry<'a> {
@@ -128,6 +133,7 @@ impl<'a> MessageRead<'a> for Entry<'a> {
                 Ok(24) => msg.cancel = r.read_bool(bytes)?,
                 Ok(32) => msg.wantType = r.read_enum(bytes)?,
                 Ok(40) => msg.sendDontHave = r.read_bool(bytes)?,
+                Ok(56) => msg.tokens.push(r.read_int32(bytes)?),
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -144,6 +150,7 @@ impl<'a> MessageWrite for Entry<'a> {
         + if self.cancel == false { 0 } else { 1 + sizeof_varint(*(&self.cancel) as u64) }
         + if self.wantType == bitswap_pb::mod_Message::mod_Wantlist::WantType::Block { 0 } else { 1 + sizeof_varint(*(&self.wantType) as u64) }
         + if self.sendDontHave == false { 0 } else { 1 + sizeof_varint(*(&self.sendDontHave) as u64) }
+        + self.tokens.iter().map(|s| 1 + sizeof_varint(*(s) as u64)).sum::<usize>()
     }
 
     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
@@ -152,6 +159,7 @@ impl<'a> MessageWrite for Entry<'a> {
         if self.cancel != false { w.write_with_tag(24, |w| w.write_bool(*&self.cancel))?; }
         if self.wantType != bitswap_pb::mod_Message::mod_Wantlist::WantType::Block { w.write_with_tag(32, |w| w.write_enum(*&self.wantType as i32))?; }
         if self.sendDontHave != false { w.write_with_tag(40, |w| w.write_bool(*&self.sendDontHave))?; }
+        for s in &self.tokens { w.write_with_tag(56, |w| w.write_int32(*s))?; }
         Ok(())
     }
 }
@@ -195,6 +203,7 @@ impl<'a> From<&'a str> for WantType {
 pub struct Block<'a> {
     pub prefix: Cow<'a, [u8]>,
     pub data: Cow<'a, [u8]>,
+    pub tokens: Vec<i32>,
 }
 
 impl<'a> MessageRead<'a> for Block<'a> {
@@ -204,6 +213,7 @@ impl<'a> MessageRead<'a> for Block<'a> {
             match r.next_tag(bytes) {
                 Ok(10) => msg.prefix = r.read_bytes(bytes).map(Cow::Borrowed)?,
                 Ok(18) => msg.data = r.read_bytes(bytes).map(Cow::Borrowed)?,
+                Ok(32) => msg.tokens.push(r.read_int32(bytes)?),
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -217,11 +227,13 @@ impl<'a> MessageWrite for Block<'a> {
         0
         + if self.prefix == Cow::Borrowed(b"") { 0 } else { 1 + sizeof_len((&self.prefix).len()) }
         + if self.data == Cow::Borrowed(b"") { 0 } else { 1 + sizeof_len((&self.data).len()) }
+        + self.tokens.iter().map(|s| 1 + sizeof_varint(*(s) as u64)).sum::<usize>()
     }
 
     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
         if self.prefix != Cow::Borrowed(b"") { w.write_with_tag(10, |w| w.write_bytes(&**&self.prefix))?; }
         if self.data != Cow::Borrowed(b"") { w.write_with_tag(18, |w| w.write_bytes(&**&self.data))?; }
+        for s in &self.tokens { w.write_with_tag(32, |w| w.write_int32(*s))?; }
         Ok(())
     }
 }
@@ -231,6 +243,7 @@ impl<'a> MessageWrite for Block<'a> {
 pub struct BlockPresence<'a> {
     pub cid: Cow<'a, [u8]>,
     pub type_pb: bitswap_pb::mod_Message::BlockPresenceType,
+    pub tokens: Vec<i32>,
 }
 
 impl<'a> MessageRead<'a> for BlockPresence<'a> {
@@ -240,6 +253,7 @@ impl<'a> MessageRead<'a> for BlockPresence<'a> {
             match r.next_tag(bytes) {
                 Ok(10) => msg.cid = r.read_bytes(bytes).map(Cow::Borrowed)?,
                 Ok(16) => msg.type_pb = r.read_enum(bytes)?,
+                Ok(32) => msg.tokens.push(r.read_int32(bytes)?),
                 Ok(t) => { r.read_unknown(bytes, t)?; }
                 Err(e) => return Err(e),
             }
@@ -253,11 +267,13 @@ impl<'a> MessageWrite for BlockPresence<'a> {
         0
         + if self.cid == Cow::Borrowed(b"") { 0 } else { 1 + sizeof_len((&self.cid).len()) }
         + if self.type_pb == bitswap_pb::mod_Message::BlockPresenceType::Have { 0 } else { 1 + sizeof_varint(*(&self.type_pb) as u64) }
+        + self.tokens.iter().map(|s| 1 + sizeof_varint(*(s) as u64)).sum::<usize>()
     }
 
     fn write_message<W: WriterBackend>(&self, w: &mut Writer<W>) -> Result<()> {
         if self.cid != Cow::Borrowed(b"") { w.write_with_tag(10, |w| w.write_bytes(&**&self.cid))?; }
         if self.type_pb != bitswap_pb::mod_Message::BlockPresenceType::Have { w.write_with_tag(16, |w| w.write_enum(*&self.type_pb as i32))?; }
+        for s in &self.tokens { w.write_with_tag(32, |w| w.write_int32(*s))?; }
         Ok(())
     }
 }

@@ -4,17 +4,17 @@ use libipld::cid::Cid;
 use libipld::store::StoreParams;
 use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
-use std::convert::TryFrom;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use thiserror::Error;
 use unsigned_varint::{aio, io::ReadError};
+use crate::Token;
 
 // version codec hash size (u64 varint is max 10 bytes) + digest
 const MAX_CID_SIZE: usize = 4 * 10 + 64;
 
 pub(crate) const LIBP2P_BITSWAP_PROTOCOL: StreamProtocol =
-    StreamProtocol::new("/ipfs-embed/bitswap/1.0.0");
+    StreamProtocol::new("/ipfs-embed/bitswap/1.1.0");
 
 #[derive(Clone)]
 pub struct BitswapCodec<P> {
@@ -126,10 +126,11 @@ pub enum RequestType {
     Block,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BitswapRequest {
     pub ty: RequestType,
     pub cid: Cid,
+    pub tokens: Vec<Token>,
 }
 
 impl BitswapRequest {
@@ -138,29 +139,54 @@ impl BitswapRequest {
             BitswapRequest {
                 ty: RequestType::Have,
                 cid,
+                tokens,
             } => {
                 w.write_all(&[0])?;
                 cid.write_bytes(&mut *w).map_err(other)?;
+                let mut buf = unsigned_varint::encode::u64_buffer();
+                let tokens_len = unsigned_varint::encode::u64(tokens.len() as u64, &mut buf);
+                w.write_all(tokens_len)?;
+                for token in tokens {
+                    token.write_to(&mut *w)?;
+                }
             }
             BitswapRequest {
                 ty: RequestType::Block,
                 cid,
+                tokens,
             } => {
                 w.write_all(&[1])?;
                 cid.write_bytes(&mut *w).map_err(other)?;
+                let mut buf = unsigned_varint::encode::u64_buffer();
+                let tokens_len = unsigned_varint::encode::u64(tokens.len() as u64, &mut buf);
+                w.write_all(tokens_len)?;
+                for token in tokens {
+                    token.write_to(&mut *w)?;
+                }
             }
         }
         Ok(())
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
-        let ty = match bytes[0] {
+    pub fn read_bytes<R: Read>(mut r: R) -> io::Result<Self> {
+        let mut buf = [0u8; 1];
+        r.read_exact(&mut buf)?;
+        let ty = match buf[0] {
             0 => RequestType::Have,
             1 => RequestType::Block,
             c => return Err(invalid_data(UnknownMessageType(c))),
         };
-        let cid = Cid::try_from(&bytes[1..]).map_err(invalid_data)?;
-        Ok(Self { ty, cid })
+        let cid = Cid::read_bytes(&mut r).map_err(invalid_data)?;
+        let tokens_len = unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
+        let mut tokens = Vec::with_capacity(tokens_len as usize);
+        for _ in 0 .. tokens_len {
+            tokens.push(Token::read_bytes(&mut r)?);
+        }
+        Ok(Self { ty, cid, tokens })
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+       Self::read_bytes(&mut bytes.as_ref())
     }
 }
 
@@ -236,10 +262,12 @@ pub(crate) mod tests {
             BitswapRequest {
                 ty: RequestType::Have,
                 cid: create_cid(&b"have_request"[..]),
+                tokens: vec![],
             },
             BitswapRequest {
                 ty: RequestType::Block,
                 cid: create_cid(&b"block_request"[..]),
+                tokens: vec![],
             },
         ];
         let mut buf = Vec::with_capacity(MAX_CID_SIZE + 1);
