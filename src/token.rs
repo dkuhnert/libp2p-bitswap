@@ -15,7 +15,7 @@ impl Token {
     /// Write token as bytes.
     pub fn write_to<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
         let mut buf = unsigned_varint::encode::u64_buffer();
-        
+
         // MultiCodec
         let multicodec = unsigned_varint::encode::u64(self.0, &mut buf);
         w.write_all(multicodec)?;
@@ -33,7 +33,8 @@ impl Token {
     /// Read token from bytes.
     pub fn read_bytes<R: io::Read>(mut r: R) -> io::Result<Self> {
         let multicodec = unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
-        let token_length = unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
+        let token_length =
+            unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
         let mut token = Vec::with_capacity(token_length as usize);
         r.read_exact(&mut token)?;
         Ok(Self(multicodec, token))

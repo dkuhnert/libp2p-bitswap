@@ -38,7 +38,10 @@ impl CompatMessage {
                     sendDontHave: true,
                     cancel: false,
                     priority: 1,
-                    tokens: tokens.iter().map(|token| push_token(&mut msg, token)).collect::<Vec<_>>(),
+                    tokens: tokens
+                        .iter()
+                        .map(|token| push_token(&mut msg, token))
+                        .collect::<Vec<_>>(),
                 };
                 wantlist.entries.push(entry);
                 msg.wantlist = Some(wantlist);
@@ -51,7 +54,10 @@ impl CompatMessage {
                     } else {
                         bitswap_pb::message::BlockPresenceType::DontHave
                     } as _,
-                    tokens: tokens.iter().map(|token| push_token(&mut msg, token)).collect::<Vec<_>>(),
+                    tokens: tokens
+                        .iter()
+                        .map(|token| push_token(&mut msg, token))
+                        .collect::<Vec<_>>(),
                 };
                 msg.blockPresences.push(block_presence);
             }
@@ -59,7 +65,10 @@ impl CompatMessage {
                 let payload = bitswap_pb::message::Block {
                     prefix: Prefix::from(cid).to_bytes().into(),
                     data: bytes.into(),
-                    tokens: tokens.iter().map(|token| push_token(&mut msg, token)).collect::<Vec<_>>(),
+                    tokens: tokens
+                        .iter()
+                        .map(|token| push_token(&mut msg, token))
+                        .collect::<Vec<_>>(),
                 };
                 msg.payload.push(payload);
             }
@@ -85,13 +94,19 @@ impl CompatMessage {
                 let cid = Cid::try_from(&*entry.block).map_err(other)?;
                 let ty = match entry.wantType {
                     ty if bitswap_pb::message::wantlist::WantType::Have == ty => RequestType::Have,
-                    ty if bitswap_pb::message::wantlist::WantType::Block == ty => RequestType::Block,
+                    ty if bitswap_pb::message::wantlist::WantType::Block == ty => {
+                        RequestType::Block
+                    }
                     _ => {
                         tracing::error!("invalid request type: skipping");
                         continue;
                     }
                 };
-                parts.push(CompatMessage::Request(BitswapRequest { ty, cid, tokens: extract_tokens(&msg, &entry.tokens)? }));
+                parts.push(CompatMessage::Request(BitswapRequest {
+                    ty,
+                    cid,
+                    tokens: extract_tokens(&msg, &entry.tokens)?,
+                }));
             }
         }
         for payload in &msg.payload {
@@ -113,7 +128,11 @@ impl CompatMessage {
                     continue;
                 }
             };
-            parts.push(CompatMessage::Response(cid, BitswapResponse::Have(have), extract_tokens(&msg, &presence.tokens)?));
+            parts.push(CompatMessage::Response(
+                cid,
+                BitswapResponse::Have(have),
+                extract_tokens(&msg, &presence.tokens)?,
+            ));
         }
         Ok(parts)
     }
@@ -121,9 +140,15 @@ impl CompatMessage {
 
 /// Extract token indicies from message.
 fn extract_tokens(message: &bitswap_pb::Message, indices: &[i32]) -> std::io::Result<Vec<Token>> {
-    indices.iter()
+    indices
+        .iter()
         .map(|index| -> std::io::Result<Token> {
-            let token = message.tokens.get(*index as usize).ok_or(Into::<std::io::Error>::into(std::io::ErrorKind::InvalidData))?;
+            let token = message
+                .tokens
+                .get(*index as usize)
+                .ok_or(Into::<std::io::Error>::into(
+                    std::io::ErrorKind::InvalidData,
+                ))?;
             Token::from_bytes(token.as_ref())
         })
         .collect()

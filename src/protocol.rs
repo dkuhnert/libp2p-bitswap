@@ -1,3 +1,4 @@
+use crate::Token;
 use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libipld::cid::Cid;
@@ -8,7 +9,6 @@ use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use thiserror::Error;
 use unsigned_varint::{aio, io::ReadError};
-use crate::Token;
 
 // version codec hash size (u64 varint is max 10 bytes) + digest
 const MAX_CID_SIZE: usize = 4 * 10 + 64;
@@ -179,14 +179,14 @@ impl BitswapRequest {
         let cid = Cid::read_bytes(&mut r).map_err(invalid_data)?;
         let tokens_len = unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
         let mut tokens = Vec::with_capacity(tokens_len as usize);
-        for _ in 0 .. tokens_len {
+        for _ in 0..tokens_len {
             tokens.push(Token::read_bytes(&mut r)?);
         }
         Ok(Self { ty, cid, tokens })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
-       Self::read_bytes(&mut bytes.as_ref())
+        Self::read_bytes(&mut bytes.as_ref())
     }
 }
 

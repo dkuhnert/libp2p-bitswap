@@ -37,9 +37,9 @@ use libp2p::swarm::{ConnectionHandlerSelect, NotifyHandler, OneShotHandler};
 use libp2p::{
     request_response::{
         Behaviour as RequestResponse, Config as RequestResponseConfig,
-        Event as RequestResponseEvent, InboundFailure, Message as RequestResponseMessage,
-        OutboundFailure, ProtocolSupport, ResponseChannel,
-        InboundRequestId, OutboundRequestId,
+        Event as RequestResponseEvent, InboundFailure, InboundRequestId,
+        Message as RequestResponseMessage, OutboundFailure, OutboundRequestId, ProtocolSupport,
+        ResponseChannel,
     },
     swarm::{ConnectionHandler, NetworkBehaviour, ToSwarm},
 };
@@ -165,8 +165,14 @@ impl<P: StoreParams> Bitswap<P> {
     }
 
     /// Starts a get query with an initial guess of providers.
-    pub fn get(&mut self, cid: Cid, peers: impl IntoIterator<Item = PeerId>, tokens: impl IntoIterator<Item = Token>) -> QueryId {
-        self.query_manager.get(None, cid, peers.into_iter(), tokens.into_iter().collect())
+    pub fn get(
+        &mut self,
+        cid: Cid,
+        peers: impl IntoIterator<Item = PeerId>,
+        tokens: impl IntoIterator<Item = Token>,
+    ) -> QueryId {
+        self.query_manager
+            .get(None, cid, peers.into_iter(), tokens.into_iter().collect())
     }
 
     /// Starts a sync query with an the initial set of missing blocks.
@@ -177,7 +183,12 @@ impl<P: StoreParams> Bitswap<P> {
         missing: impl IntoIterator<Item = Cid>,
         tokens: impl IntoIterator<Item = Token>,
     ) -> QueryId {
-        self.query_manager.sync(cid, peers, missing.into_iter(), tokens.into_iter().collect())
+        self.query_manager.sync(
+            cid,
+            peers,
+            missing.into_iter(),
+            tokens.into_iter().collect(),
+        )
     }
 
     /// Cancels an in progress query. Returns true if a query was cancelled.
@@ -236,7 +247,11 @@ fn start_db_thread<S: BitswapStore>(
                 DbRequest::Bitswap(channel, request) => {
                     let response = match request.ty {
                         RequestType::Have => {
-                            let have = store.contains(&request.cid, &request.tokens).await.ok().unwrap_or_default();
+                            let have = store
+                                .contains(&request.cid, &request.tokens)
+                                .await
+                                .ok()
+                                .unwrap_or_default();
                             if have {
                                 RESPONSES_TOTAL.with_label_values(&["have"]).inc();
                             } else {
@@ -246,7 +261,11 @@ fn start_db_thread<S: BitswapStore>(
                             BitswapResponse::Have(have)
                         }
                         RequestType::Block => {
-                            let block = store.get(&request.cid, &request.tokens).await.ok().unwrap_or_default();
+                            let block = store
+                                .get(&request.cid, &request.tokens)
+                                .await
+                                .ok()
+                                .unwrap_or_default();
                             if let Some(data) = block {
                                 RESPONSES_TOTAL.with_label_values(&["block"]).inc();
                                 SENT_BLOCK_BYTES.inc_by(data.len() as u64);
@@ -301,7 +320,9 @@ impl<P: StoreParams> Bitswap<P> {
                         let len = data.len();
                         if let Ok(block) = Block::new(info.cid, data) {
                             RECEIVED_BLOCK_BYTES.inc_by(len as u64);
-                            self.db_tx.unbounded_send(DbRequest::Insert(block, info.tokens.clone())).ok();
+                            self.db_tx
+                                .unbounded_send(DbRequest::Insert(block, info.tokens.clone()))
+                                .ok();
                             self.query_manager
                                 .inject_response(id, Response::Block(peer, true));
                         } else {
@@ -346,10 +367,8 @@ impl<P: StoreParams> Bitswap<P> {
                     .inc();
             }
             OutboundFailure::Io(_) => {
-                OUTBOUND_FAILURE
-                    .with_label_values(&["io"])
-                    .inc();
-            },
+                OUTBOUND_FAILURE.with_label_values(&["io"]).inc();
+            }
         }
     }
 
@@ -385,10 +404,8 @@ impl<P: StoreParams> Bitswap<P> {
                     .inc();
             }
             InboundFailure::Io(_) => {
-                INBOUND_FAILURE
-                    .with_label_values(&["io"])
-                    .inc();
-            },
+                INBOUND_FAILURE.with_label_values(&["io"]).inc();
+            }
         }
     }
 }
@@ -531,7 +548,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
             FromSwarm::ExternalAddrExpired(ev) => self
                 .inner
                 .on_swarm_event(FromSwarm::ExternalAddrExpired(ev)),
-            _ => {},
+            _ => {}
         }
     }
 
@@ -566,10 +583,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
         }
     }
 
-    fn poll(
-        &mut self,
-        cx: &mut Context,
-    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         let mut exit = false;
         while !exit {
             exit = true;
@@ -630,7 +644,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                 }
                                 Request::MissingBlocks(cid) => {
                                     self.db_tx
-                                        .unbounded_send(DbRequest::MissingBlocks(id, cid, query_header.tokens.clone()))
+                                        .unbounded_send(DbRequest::MissingBlocks(
+                                            id,
+                                            cid,
+                                            query_header.tokens.clone(),
+                                        ))
                                         .ok();
                                 }
                             }
@@ -696,10 +714,8 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             peer_id,
                             connection,
                         });
-                    },
-                    _ => {
-                        continue
-                    },
+                    }
+                    _ => continue,
                 };
                 match event {
                     RequestResponseEvent::Message { peer, message } => match message {
@@ -730,7 +746,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                                         "block" => RequestType::Block,
                                         _ => unreachable!(),
                                     };
-                                    let request = BitswapRequest { ty, cid: info.cid, tokens: info.tokens.clone() };
+                                    let request = BitswapRequest {
+                                        ty,
+                                        cid: info.cid,
+                                        tokens: info.tokens.clone(),
+                                    };
                                     self.requests.insert(BitswapId::Compat(info.cid), id);
                                     tracing::trace!("adding compat peer {}", peer);
                                     self.compat.insert(peer);
@@ -772,8 +792,8 @@ mod tests {
     use libipld::ipld::Ipld;
     use libipld::multihash::Code;
     use libipld::store::DefaultParams;
-    use libp2p::{tcp, noise, yamux, SwarmBuilder};
     use libp2p::swarm::SwarmEvent;
+    use libp2p::{noise, tcp, yamux, SwarmBuilder};
     use libp2p::{PeerId, Swarm};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::TestWriter;
@@ -836,11 +856,27 @@ mod tests {
             let store = Store::default();
             let mut swarm = SwarmBuilder::with_new_identity()
                 .with_async_std()
-                .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default).unwrap()
-                .with_behaviour(|_| Bitswap::new(BitswapConfig::new(), store.clone(), Box::new(|t| { async_std::task::spawn(t); }))).unwrap()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )
+                .unwrap()
+                .with_behaviour(|_| {
+                    Bitswap::new(
+                        BitswapConfig::new(),
+                        store.clone(),
+                        Box::new(|t| {
+                            async_std::task::spawn(t);
+                        }),
+                    )
+                })
+                .unwrap()
                 .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(20)))
                 .build();
-            swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
             while swarm.next().now_or_never().is_some() {}
             let addr = Swarm::listeners(&swarm).next().unwrap().clone();
             Self {
@@ -914,10 +950,11 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2
-            .swarm()
-            .behaviour_mut()
-            .get(*block.cid(), std::iter::once(peer1), std::iter::empty());
+        let id = peer2.swarm().behaviour_mut().get(
+            *block.cid(),
+            std::iter::once(peer1),
+            std::iter::empty(),
+        );
 
         assert_complete_ok(peer2.next().await, id);
     }
@@ -933,10 +970,11 @@ mod tests {
         peer1.store().insert(*block.cid(), block.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id = peer2
-            .swarm()
-            .behaviour_mut()
-            .get(*block.cid(), std::iter::once(peer1), std::iter::empty());
+        let id = peer2.swarm().behaviour_mut().get(
+            *block.cid(),
+            std::iter::once(peer1),
+            std::iter::empty(),
+        );
         peer2.swarm().behaviour_mut().cancel(id);
         let res = peer2.next().now_or_never();
         println!("{:?}", res);
@@ -966,11 +1004,12 @@ mod tests {
         peer1.store().insert(*b2.cid(), b2.data().to_vec());
         let peer1 = peer1.spawn("peer1");
 
-        let id =
-            peer2
-                .swarm()
-                .behaviour_mut()
-                .sync(*b2.cid(), vec![peer1], std::iter::once(*b2.cid()), std::iter::empty());
+        let id = peer2.swarm().behaviour_mut().sync(
+            *b2.cid(),
+            vec![peer1],
+            std::iter::once(*b2.cid()),
+            std::iter::empty(),
+        );
 
         assert_progress(peer2.next().await, id, 1);
         assert_progress(peer2.next().await, id, 1);
@@ -1017,10 +1056,10 @@ mod tests {
         peer.swarm()
             .behaviour_mut()
             .add_address(&peer_id, multiaddr);
-        let id = peer
-            .swarm()
-            .behaviour_mut()
-            .get(cid, std::iter::once(peer_id), std::iter::empty());
+        let id =
+            peer.swarm()
+                .behaviour_mut()
+                .get(cid, std::iter::once(peer_id), std::iter::empty());
         assert_complete_ok(peer.next().await, id);
     }
 }

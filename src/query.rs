@@ -1,4 +1,7 @@
-use crate::{stats::{REQUESTS_TOTAL, REQUEST_DURATION_SECONDS}, Token};
+use crate::{
+    stats::{REQUESTS_TOTAL, REQUEST_DURATION_SECONDS},
+    Token,
+};
 use fnv::{FnvHashMap, FnvHashSet};
 use libipld::Cid;
 use libp2p::PeerId;
@@ -169,12 +172,33 @@ impl QueryManager {
     }
 
     /// Starts a new have query to ask a peer if it has a block.
-    fn have(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid, tokens: Vec<Token>) -> QueryId {
-        self.start_query(root, Some(parent), cid, Request::Have(peer_id, cid), "have", tokens)
+    fn have(
+        &mut self,
+        root: QueryId,
+        parent: QueryId,
+        peer_id: PeerId,
+        cid: Cid,
+        tokens: Vec<Token>,
+    ) -> QueryId {
+        self.start_query(
+            root,
+            Some(parent),
+            cid,
+            Request::Have(peer_id, cid),
+            "have",
+            tokens,
+        )
     }
 
     /// Starts a new block query to request a block from a peer.
-    fn block(&mut self, root: QueryId, parent: QueryId, peer_id: PeerId, cid: Cid, tokens: Vec<Token>) -> QueryId {
+    fn block(
+        &mut self,
+        root: QueryId,
+        parent: QueryId,
+        peer_id: PeerId,
+        cid: Cid,
+        tokens: Vec<Token>,
+    ) -> QueryId {
         self.start_query(
             root,
             Some(parent),
@@ -217,7 +241,9 @@ impl QueryManager {
             if state.block.is_none() {
                 state.block = Some(self.block(root, id, peer, cid, tokens.clone()));
             } else {
-                state.have.insert(self.have(root, id, peer, cid, tokens.clone()));
+                state
+                    .have
+                    .insert(self.have(root, id, peer, cid, tokens.clone()));
             }
         }
         assert!(state.block.is_some());
@@ -254,12 +280,17 @@ impl QueryManager {
         tracing::trace!("{} {} sync", id, id);
         let mut state = SyncState::default();
         for cid in missing {
-            state
-                .missing
-                .insert(self.get(Some(id), cid, providers.iter().copied(), tokens.clone()));
+            state.missing.insert(self.get(
+                Some(id),
+                cid,
+                providers.iter().copied(),
+                tokens.clone(),
+            ));
         }
         if state.missing.is_empty() {
-            state.children.insert(self.missing_blocks(id, cid, tokens.clone()));
+            state
+                .children
+                .insert(self.missing_blocks(id, cid, tokens.clone()));
         }
         state.providers = providers;
         let query = Query {
@@ -463,9 +494,11 @@ impl QueryManager {
                 if res.is_err() {
                     Transition::Complete(res)
                 } else {
-                    state
-                        .children
-                        .insert(mgr.missing_blocks(parent.root, query.cid, take(&mut query.tokens)));
+                    state.children.insert(mgr.missing_blocks(
+                        parent.root,
+                        query.cid,
+                        take(&mut query.tokens),
+                    ));
                     Transition::Next(state)
                 }
             });

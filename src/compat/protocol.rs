@@ -1,8 +1,15 @@
 use crate::compat::{other, CompatMessage};
-use futures::{SinkExt, StreamExt, io::{AsyncRead, AsyncWrite, AsyncWriteExt}, future::BoxFuture};
-use libp2p::{StreamProtocol, core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo}};
-use std::{io, iter};
 use asynchronous_codec::{FramedRead, FramedWrite, LengthCodec};
+use futures::{
+    future::BoxFuture,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    SinkExt, StreamExt,
+};
+use libp2p::{
+    core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
+    StreamProtocol,
+};
+use std::{io, iter};
 
 // 2MB Block Size according to the specs at https://github.com/ipfs/specs/blob/main/BITSWAP.md
 const MAX_BUF_SIZE: usize = 2_097_152;
@@ -39,7 +46,7 @@ where
                     other(err)
                 })??;
             if packet.len() > MAX_BUF_SIZE {
-                return Err(io::ErrorKind::InvalidData.into())
+                return Err(io::ErrorKind::InvalidData.into());
             }
             socket.close().await?;
             tracing::trace!("inbound upgrade done, closing");
