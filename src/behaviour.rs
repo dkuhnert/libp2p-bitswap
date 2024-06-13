@@ -880,7 +880,7 @@ mod tests {
             while swarm.next().now_or_never().is_some() {}
             let addr = Swarm::listeners(&swarm).next().unwrap().clone();
             Self {
-                peer_id: swarm.local_peer_id().clone(),
+                peer_id: *swarm.local_peer_id(),
                 addr,
                 store,
                 swarm,

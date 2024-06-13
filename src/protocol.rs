@@ -186,7 +186,7 @@ impl BitswapRequest {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
-        Self::read_bytes(&mut bytes.as_ref())
+        Self::read_bytes(bytes)
     }
 }
 
