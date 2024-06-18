@@ -66,11 +66,22 @@ pub trait BitswapStore: Send + Sync + 'static {
     /// The store params.
     type Params: StoreParams;
     /// A have query needs to know if the block store contains the block.
-    async fn contains(&mut self, cid: &Cid, tokens: &[Token]) -> Result<bool>;
+    async fn contains(&mut self, cid: &Cid, remote_peer: &PeerId, tokens: &[Token])
+        -> Result<bool>;
     /// A block query needs to retrieve the block from the store.
-    async fn get(&mut self, cid: &Cid, tokens: &[Token]) -> Result<Option<Vec<u8>>>;
+    async fn get(
+        &mut self,
+        cid: &Cid,
+        remote_peer: &PeerId,
+        tokens: &[Token],
+    ) -> Result<Option<Vec<u8>>>;
     /// A block response needs to insert the block into the store.
-    async fn insert(&mut self, block: &Block<Self::Params>, tokens: &[Token]) -> Result<()>;
+    async fn insert(
+        &mut self,
+        block: &Block<Self::Params>,
+        remote_peer: &PeerId,
+        tokens: &[Token],
+    ) -> Result<()>;
     /// A sync query needs a list of missing blocks to make progress.
     async fn missing_blocks(&mut self, cid: &Cid, tokens: &[Token]) -> Result<Vec<Cid>>;
 }
@@ -221,8 +232,8 @@ impl<P: StoreParams> Bitswap<P> {
 }
 
 enum DbRequest<P: StoreParams> {
-    Bitswap(BitswapChannel, BitswapRequest),
-    Insert(Block<P>, Vec<Token>),
+    Bitswap(BitswapChannel, BitswapRequest, PeerId),
+    Insert(Block<P>, Vec<Token>, PeerId),
     MissingBlocks(QueryId, Cid, Vec<Token>),
 }
 
@@ -244,11 +255,11 @@ fn start_db_thread<S: BitswapStore>(
         let mut requests: mpsc::UnboundedReceiver<DbRequest<S::Params>> = requests;
         while let Some(request) = requests.next().await {
             match request {
-                DbRequest::Bitswap(channel, request) => {
+                DbRequest::Bitswap(channel, request, remote_peer) => {
                     let response = match request.ty {
                         RequestType::Have => {
                             let have = store
-                                .contains(&request.cid, &request.tokens)
+                                .contains(&request.cid, &remote_peer, &request.tokens)
                                 .await
                                 .ok()
                                 .unwrap_or_default();
@@ -262,7 +273,7 @@ fn start_db_thread<S: BitswapStore>(
                         }
                         RequestType::Block => {
                             let block = store
-                                .get(&request.cid, &request.tokens)
+                                .get(&request.cid, &remote_peer, &request.tokens)
                                 .await
                                 .ok()
                                 .unwrap_or_default();
@@ -282,8 +293,8 @@ fn start_db_thread<S: BitswapStore>(
                         .unbounded_send(DbResponse::Bitswap(channel, response, request.tokens))
                         .ok();
                 }
-                DbRequest::Insert(block, tokens) => {
-                    if let Err(err) = store.insert(&block, &tokens).await {
+                DbRequest::Insert(block, tokens, remote_peer) => {
+                    if let Err(err) = store.insert(&block, &remote_peer, &tokens).await {
                         tracing::error!("error inserting blocks {}", err);
                     }
                 }
@@ -301,9 +312,9 @@ fn start_db_thread<S: BitswapStore>(
 
 impl<P: StoreParams> Bitswap<P> {
     /// Processes an incoming bitswap request.
-    fn inject_request(&mut self, channel: BitswapChannel, request: BitswapRequest) {
+    fn inject_request(&mut self, channel: BitswapChannel, peer: PeerId, request: BitswapRequest) {
         self.db_tx
-            .unbounded_send(DbRequest::Bitswap(channel, request))
+            .unbounded_send(DbRequest::Bitswap(channel, request, peer))
             .ok();
     }
 
@@ -321,7 +332,7 @@ impl<P: StoreParams> Bitswap<P> {
                         if let Ok(block) = Block::new(info.cid, data) {
                             RECEIVED_BLOCK_BYTES.inc_by(len as u64);
                             self.db_tx
-                                .unbounded_send(DbRequest::Insert(block, info.tokens.clone()))
+                                .unbounded_send(DbRequest::Insert(block, info.tokens.clone(), peer))
                                 .ok();
                             self.query_manager
                                 .inject_response(id, Response::Block(peer, true));
@@ -723,7 +734,7 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             request_id: _,
                             request,
                             channel,
-                        } => self.inject_request(BitswapChannel::Bitswap(channel), request),
+                        } => self.inject_request(BitswapChannel::Bitswap(channel), peer, request),
                         RequestResponseMessage::Response {
                             request_id,
                             response,
@@ -816,25 +827,40 @@ mod tests {
     #[async_trait::async_trait]
     impl BitswapStore for Store {
         type Params = DefaultParams;
-        async fn contains(&mut self, cid: &Cid, _tokens: &[Token]) -> Result<bool> {
+        async fn contains(
+            &mut self,
+            cid: &Cid,
+            _remote_peer: &PeerId,
+            _tokens: &[Token],
+        ) -> Result<bool> {
             Ok(self.0.lock().unwrap().contains_key(cid))
         }
-        async fn get(&mut self, cid: &Cid, _tokens: &[Token]) -> Result<Option<Vec<u8>>> {
+        async fn get(
+            &mut self,
+            cid: &Cid,
+            _remote_peer: &PeerId,
+            _tokens: &[Token],
+        ) -> Result<Option<Vec<u8>>> {
             Ok(self.0.lock().unwrap().get(cid).cloned())
         }
-        async fn insert(&mut self, block: &Block<Self::Params>, _tokens: &[Token]) -> Result<()> {
+        async fn insert(
+            &mut self,
+            block: &Block<Self::Params>,
+            _remote_peer: &PeerId,
+            _tokens: &[Token],
+        ) -> Result<()> {
             self.0
                 .lock()
                 .unwrap()
                 .insert(*block.cid(), block.data().to_vec());
             Ok(())
         }
-        async fn missing_blocks(&mut self, cid: &Cid, tokens: &[Token]) -> Result<Vec<Cid>> {
+        async fn missing_blocks(&mut self, cid: &Cid, _tokens: &[Token]) -> Result<Vec<Cid>> {
             let mut stack = vec![*cid];
             let mut missing = vec![];
             while let Some(cid) = stack.pop() {
-                if let Some(data) = self.get(&cid, tokens).await? {
-                    let block = Block::<Self::Params>::new_unchecked(cid, data);
+                if let Some(data) = self.0.lock().unwrap().get(&cid) {
+                    let block = Block::<Self::Params>::new_unchecked(cid, data.clone());
                     block.references(&mut stack)?;
                 } else {
                     missing.push(cid);
