@@ -1,4 +1,7 @@
-use std::io;
+use std::{
+    convert::TryInto,
+    io::{self, ErrorKind},
+};
 
 /// Bitswap authentication.
 /// See: https://github.com/ipfs/specs/pull/270
@@ -21,7 +24,13 @@ impl Token {
         w.write_all(multicodec)?;
 
         // TokenLength
-        let token_length = unsigned_varint::encode::u64(self.1.len() as u64, &mut buf);
+        let token_length = unsigned_varint::encode::u64(
+            self.1
+                .len()
+                .try_into()
+                .map_err(|_| ErrorKind::InvalidInput)?,
+            &mut buf,
+        );
         w.write_all(token_length)?;
 
         // TokenValue
@@ -35,14 +44,19 @@ impl Token {
         let multicodec = unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
         let token_length =
             unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
-        let mut token = Vec::with_capacity(token_length as usize);
+        let mut token = vec![
+            0;
+            token_length
+                .try_into()
+                .map_err(|_| ErrorKind::InvalidInput)?
+        ];
         r.read_exact(&mut token)?;
         Ok(Self(multicodec, token))
     }
 
     /// Token as bytes vector.
     pub fn to_vec(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(8 + 8 + self.1.len());
+        let mut result = vec![0; 8 + 8 + self.1.len()];
         self.write_to(&mut result).unwrap();
         result
     }

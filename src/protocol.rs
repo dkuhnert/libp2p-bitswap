@@ -5,13 +5,15 @@ use libipld::cid::Cid;
 use libipld::store::StoreParams;
 use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
-use std::io::{self, Read, Write};
+use std::convert::TryInto;
+use std::io::{self, ErrorKind, Read, Write};
 use std::marker::PhantomData;
 use thiserror::Error;
 use unsigned_varint::{aio, io::ReadError};
 
 // version codec hash size (u64 varint is max 10 bytes) + digest
 const MAX_CID_SIZE: usize = 4 * 10 + 64;
+const MAX_TOKEN_SIZE: usize = 1024 * 1024;
 
 pub(crate) const LIBP2P_BITSWAP_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/ipfs-embed/bitswap/1.1.0");
@@ -24,7 +26,7 @@ pub struct BitswapCodec<P> {
 
 impl<P: StoreParams> Default for BitswapCodec<P> {
     fn default() -> Self {
-        let capacity = usize::max(P::MAX_BLOCK_SIZE, MAX_CID_SIZE) + 1;
+        let capacity = usize::max(P::MAX_BLOCK_SIZE, usize::max(MAX_CID_SIZE, MAX_TOKEN_SIZE)) + 1;
         debug_assert!(capacity <= u32::MAX as usize);
         Self {
             _marker: PhantomData,
@@ -47,7 +49,7 @@ impl<P: StoreParams> Codec for BitswapCodec<P> {
             ReadError::Io(e) => e,
             err => other(err),
         })?);
-        if msg_len > MAX_CID_SIZE + 1 {
+        if msg_len > MAX_CID_SIZE + MAX_TOKEN_SIZE + 1 {
             return Err(invalid_data(MessageTooLarge(msg_len)));
         }
         self.buffer.resize(msg_len, 0);
@@ -88,7 +90,7 @@ impl<P: StoreParams> Codec for BitswapCodec<P> {
     {
         self.buffer.clear();
         req.write_to(&mut self.buffer)?;
-        if self.buffer.len() > MAX_CID_SIZE + 1 {
+        if self.buffer.len() > MAX_CID_SIZE + MAX_TOKEN_SIZE + 1 {
             return Err(invalid_data(MessageTooLarge(self.buffer.len())));
         }
         let mut buf = unsigned_varint::encode::u32_buffer();
@@ -144,7 +146,13 @@ impl BitswapRequest {
                 w.write_all(&[0])?;
                 cid.write_bytes(&mut *w).map_err(other)?;
                 let mut buf = unsigned_varint::encode::u64_buffer();
-                let tokens_len = unsigned_varint::encode::u64(tokens.len() as u64, &mut buf);
+                let tokens_len = unsigned_varint::encode::u64(
+                    tokens
+                        .len()
+                        .try_into()
+                        .map_err(|_| ErrorKind::InvalidInput)?,
+                    &mut buf,
+                );
                 w.write_all(tokens_len)?;
                 for token in tokens {
                     token.write_to(&mut *w)?;
@@ -158,7 +166,13 @@ impl BitswapRequest {
                 w.write_all(&[1])?;
                 cid.write_bytes(&mut *w).map_err(other)?;
                 let mut buf = unsigned_varint::encode::u64_buffer();
-                let tokens_len = unsigned_varint::encode::u64(tokens.len() as u64, &mut buf);
+                let tokens_len = unsigned_varint::encode::u64(
+                    tokens
+                        .len()
+                        .try_into()
+                        .map_err(|_| ErrorKind::InvalidInput)?,
+                    &mut buf,
+                );
                 w.write_all(tokens_len)?;
                 for token in tokens {
                     token.write_to(&mut *w)?;
@@ -178,7 +192,8 @@ impl BitswapRequest {
         };
         let cid = Cid::read_bytes(&mut r).map_err(invalid_data)?;
         let tokens_len = unsigned_varint::io::read_u64(&mut r).map_err(Into::<io::Error>::into)?;
-        let mut tokens = Vec::with_capacity(tokens_len as usize);
+        let mut tokens =
+            Vec::with_capacity(tokens_len.try_into().map_err(|_| ErrorKind::InvalidInput)?);
         for _ in 0..tokens_len {
             tokens.push(Token::read_bytes(&mut r)?);
         }

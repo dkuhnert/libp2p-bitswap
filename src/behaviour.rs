@@ -581,7 +581,11 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                         match msg {
                             CompatMessage::Request(req) => {
                                 tracing::trace!("received compat request");
-                                self.inject_request(BitswapChannel::Compat(peer_id, req.cid), req);
+                                self.inject_request(
+                                    BitswapChannel::Compat(peer_id, req.cid),
+                                    peer_id,
+                                    req,
+                                );
                             }
                             CompatMessage::Response(cid, res, _tokens) => {
                                 tracing::trace!("received compat response");
@@ -822,7 +826,15 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct Store(Arc<Mutex<FnvHashMap<Cid, Vec<u8>>>>);
+    struct Store(Arc<Mutex<FnvHashMap<Cid, StoryEntry>>>);
+
+    #[derive(Clone, Default)]
+    struct StoryEntry(Vec<u8>, Option<PeerId>, Vec<Token>);
+    impl From<Vec<u8>> for StoryEntry {
+        fn from(value: Vec<u8>) -> Self {
+            StoryEntry(value, None, vec![])
+        }
+    }
 
     #[async_trait::async_trait]
     impl BitswapStore for Store {
@@ -838,28 +850,46 @@ mod tests {
         async fn get(
             &mut self,
             cid: &Cid,
-            _remote_peer: &PeerId,
-            _tokens: &[Token],
+            remote_peer: &PeerId,
+            tokens: &[Token],
         ) -> Result<Option<Vec<u8>>> {
-            Ok(self.0.lock().unwrap().get(cid).cloned())
+            match self.0.lock().unwrap().get(cid) {
+                Some(StoryEntry(data, None, valid_tokens)) if valid_tokens.is_empty() => {
+                    Ok(Some(data.clone()))
+                }
+                Some(StoryEntry(data, Some(valid_peer), valid_tokens))
+                    if valid_peer == remote_peer
+                        && valid_tokens
+                            .iter()
+                            .filter(|item| tokens.contains(item))
+                            .next()
+                            .is_some() =>
+                {
+                    Ok(Some(data.clone()))
+                }
+                Some(StoryEntry(data, None, valid_tokens)) if !valid_tokens.is_empty() => {
+                    Ok(Some(data.clone()))
+                }
+                _ => Ok(None),
+            }
         }
         async fn insert(
             &mut self,
             block: &Block<Self::Params>,
-            _remote_peer: &PeerId,
-            _tokens: &[Token],
+            remote_peer: &PeerId,
+            tokens: &[Token],
         ) -> Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(*block.cid(), block.data().to_vec());
+            self.0.lock().unwrap().insert(
+                *block.cid(),
+                StoryEntry(block.data().to_vec(), Some(*remote_peer), tokens.to_vec()),
+            );
             Ok(())
         }
         async fn missing_blocks(&mut self, cid: &Cid, _tokens: &[Token]) -> Result<Vec<Cid>> {
             let mut stack = vec![*cid];
             let mut missing = vec![];
             while let Some(cid) = stack.pop() {
-                if let Some(data) = self.0.lock().unwrap().get(&cid) {
+                if let Some(StoryEntry(data, _, _)) = self.0.lock().unwrap().get(&cid) {
                     let block = Block::<Self::Params>::new_unchecked(cid, data.clone());
                     block.references(&mut stack)?;
                 } else {
@@ -919,7 +949,7 @@ mod tests {
                 .add_address(&peer.peer_id, peer.addr.clone());
         }
 
-        fn store(&mut self) -> impl std::ops::DerefMut<Target = FnvHashMap<Cid, Vec<u8>>> + '_ {
+        fn store(&mut self) -> impl std::ops::DerefMut<Target = FnvHashMap<Cid, StoryEntry>> + '_ {
             self.store.0.lock().unwrap()
         }
 
@@ -965,6 +995,14 @@ mod tests {
         }
     }
 
+    fn assert_complete_err(event: Option<BitswapEvent>, id: QueryId) {
+        if let Some(BitswapEvent::Complete(id2, Err(_))) = event {
+            assert_eq!(id2, id);
+        } else {
+            panic!("{:?} is not a complete event", event);
+        }
+    }
+
     #[async_std::test]
     async fn test_bitswap_get() {
         tracing_try_init();
@@ -973,7 +1011,9 @@ mod tests {
         peer2.add_address(&peer1);
 
         let block = create_block(ipld!(&b"hello world"[..]));
-        peer1.store().insert(*block.cid(), block.data().to_vec());
+        peer1
+            .store()
+            .insert(*block.cid(), block.data().to_vec().into());
         let peer1 = peer1.spawn("peer1");
 
         let id = peer2.swarm().behaviour_mut().get(
@@ -993,7 +1033,9 @@ mod tests {
         peer2.add_address(&peer1);
 
         let block = create_block(ipld!(&b"hello world"[..]));
-        peer1.store().insert(*block.cid(), block.data().to_vec());
+        peer1
+            .store()
+            .insert(*block.cid(), block.data().to_vec().into());
         let peer1 = peer1.spawn("peer1");
 
         let id = peer2.swarm().behaviour_mut().get(
@@ -1005,6 +1047,43 @@ mod tests {
         let res = peer2.next().now_or_never();
         println!("{:?}", res);
         assert!(res.is_none());
+    }
+
+    #[async_std::test]
+    async fn test_bitswap_get_token() {
+        tracing_try_init();
+        let mut peer1 = Peer::new();
+        let mut peer2 = Peer::new();
+        peer2.add_address(&peer1);
+
+        let token = Token(0, vec![0].repeat(1024));
+
+        let block = create_block(ipld!(&b"hello world"[..]));
+        peer1.store().insert(
+            *block.cid(),
+            StoryEntry(
+                block.data().to_vec(),
+                Some(peer2.peer_id),
+                vec![token.clone()],
+            ),
+        );
+        let peer1 = peer1.spawn("peer1");
+
+        // with token
+        let id = peer2.swarm().behaviour_mut().get(
+            *block.cid(),
+            std::iter::once(peer1),
+            std::iter::once(token),
+        );
+        assert_complete_ok(peer2.next().await, id);
+
+        // without token
+        let id = peer2.swarm().behaviour_mut().get(
+            *block.cid(),
+            std::iter::once(peer1),
+            std::iter::empty(),
+        );
+        assert_complete_err(peer2.next().await, id);
     }
 
     #[async_std::test]
@@ -1025,9 +1104,9 @@ mod tests {
             "prev": b1.cid(),
             "n": 2,
         }));
-        peer1.store().insert(*b0.cid(), b0.data().to_vec());
-        peer1.store().insert(*b1.cid(), b1.data().to_vec());
-        peer1.store().insert(*b2.cid(), b2.data().to_vec());
+        peer1.store().insert(*b0.cid(), b0.data().to_vec().into());
+        peer1.store().insert(*b1.cid(), b1.data().to_vec().into());
+        peer1.store().insert(*b2.cid(), b2.data().to_vec().into());
         let peer1 = peer1.spawn("peer1");
 
         let id = peer2.swarm().behaviour_mut().sync(
@@ -1051,7 +1130,9 @@ mod tests {
         peer2.add_address(&peer1);
 
         let block = create_block(ipld!(&b"hello world"[..]));
-        peer1.store().insert(*block.cid(), block.data().to_vec());
+        peer1
+            .store()
+            .insert(*block.cid(), block.data().to_vec().into());
         let peer1 = peer1.spawn("peer1");
 
         let id = peer2.swarm().behaviour_mut().sync(
