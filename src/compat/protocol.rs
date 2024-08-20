@@ -65,7 +65,7 @@ impl UpgradeInfo for CompatMessage {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+        iter::once(StreamProtocol::new("/ipfs/bitswap/1.3.0"))
     }
 }
 
@@ -82,7 +82,6 @@ where
             let bytes = self.to_bytes()?;
             let mut framed = FramedWrite::new(&mut socket, LengthCodec {});
             framed.send(bytes.into()).await?;
-            framed.flush().await?;
             socket.close().await?;
             Ok(())
         })
