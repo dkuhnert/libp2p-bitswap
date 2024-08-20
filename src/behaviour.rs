@@ -233,12 +233,13 @@ impl<P: StoreParams> Bitswap<P> {
 
 enum DbRequest<P: StoreParams> {
     Bitswap(BitswapChannel, BitswapRequest, PeerId),
-    Insert(Block<P>, Vec<Token>, PeerId),
+    Insert(QueryId, Block<P>, Vec<Token>, PeerId),
     MissingBlocks(QueryId, Cid, Vec<Token>),
 }
 
 enum DbResponse {
     Bitswap(BitswapChannel, BitswapResponse, Vec<Token>),
+    Insert(QueryId, PeerId, Result<()>),
     MissingBlocks(QueryId, Result<Vec<Cid>>),
 }
 
@@ -293,10 +294,14 @@ fn start_db_thread<S: BitswapStore>(
                         .unbounded_send(DbResponse::Bitswap(channel, response, request.tokens))
                         .ok();
                 }
-                DbRequest::Insert(block, tokens, remote_peer) => {
-                    if let Err(err) = store.insert(&block, &remote_peer, &tokens).await {
+                DbRequest::Insert(id, block, tokens, remote_peer) => {
+                    let res = store.insert(&block, &remote_peer, &tokens).await;
+                    if let Err(err) = &res {
                         tracing::error!("error inserting blocks {}", err);
                     }
+                    responses
+                        .unbounded_send(DbResponse::Insert(id, remote_peer, res))
+                        .ok();
                 }
                 DbRequest::MissingBlocks(id, cid, tokens) => {
                     let res = store.missing_blocks(&cid, &tokens).await;
@@ -332,10 +337,13 @@ impl<P: StoreParams> Bitswap<P> {
                         if let Ok(block) = Block::new(info.cid, data) {
                             RECEIVED_BLOCK_BYTES.inc_by(len as u64);
                             self.db_tx
-                                .unbounded_send(DbRequest::Insert(block, info.tokens.clone(), peer))
+                                .unbounded_send(DbRequest::Insert(
+                                    id,
+                                    block,
+                                    info.tokens.clone(),
+                                    peer,
+                                ))
                                 .ok();
-                            self.query_manager
-                                .inject_response(id, Response::Block(peer, true));
                         } else {
                             tracing::error!("received invalid block");
                             RECEIVED_INVALID_BLOCK_BYTES.inc_by(len as u64);
@@ -619,6 +627,17 @@ impl<P: StoreParams> NetworkBehaviour for Bitswap<P> {
                             });
                         }
                     },
+                    DbResponse::Insert(id, peer, res) => match res {
+                        Ok(_) => {
+                            self.query_manager
+                                .inject_response(id, Response::Block(peer, true));
+                        }
+                        Err(err) => {
+                            self.query_manager.cancel(id);
+                            let event = BitswapEvent::Complete(id, Err(err));
+                            return Poll::Ready(ToSwarm::GenerateEvent(event));
+                        }
+                    },
                     DbResponse::MissingBlocks(id, res) => match res {
                         Ok(missing) => {
                             MISSING_BLOCKS_TOTAL.inc_by(missing.len() as u64);
@@ -859,11 +878,7 @@ mod tests {
                 }
                 Some(StoryEntry(data, Some(valid_peer), valid_tokens))
                     if valid_peer == remote_peer
-                        && valid_tokens
-                            .iter()
-                            .filter(|item| tokens.contains(item))
-                            .next()
-                            .is_some() =>
+                        && valid_tokens.iter().any(|item| tokens.contains(item)) =>
                 {
                     Ok(Some(data.clone()))
                 }
@@ -900,6 +915,50 @@ mod tests {
         }
     }
 
+    struct SlowStore(Store, Option<Duration>);
+    impl SlowStore {
+        async fn slow(&self) {
+            if let Some(duration) = self.1 {
+                async_std::task::sleep(duration).await;
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl BitswapStore for SlowStore {
+        type Params = <Store as BitswapStore>::Params;
+        async fn contains(
+            &mut self,
+            cid: &Cid,
+            remote_peer: &PeerId,
+            tokens: &[Token],
+        ) -> Result<bool> {
+            self.slow().await;
+            self.0.contains(cid, remote_peer, tokens).await
+        }
+        async fn get(
+            &mut self,
+            cid: &Cid,
+            remote_peer: &PeerId,
+            tokens: &[Token],
+        ) -> Result<Option<Vec<u8>>> {
+            self.slow().await;
+            self.0.get(cid, remote_peer, tokens).await
+        }
+        async fn insert(
+            &mut self,
+            block: &Block<Self::Params>,
+            remote_peer: &PeerId,
+            tokens: &[Token],
+        ) -> Result<()> {
+            self.slow().await;
+            self.0.insert(block, remote_peer, tokens).await
+        }
+        async fn missing_blocks(&mut self, cid: &Cid, tokens: &[Token]) -> Result<Vec<Cid>> {
+            self.slow().await;
+            self.0.missing_blocks(cid, tokens).await
+        }
+    }
+
     struct Peer {
         peer_id: PeerId,
         addr: Multiaddr,
@@ -909,6 +968,14 @@ mod tests {
 
     impl Peer {
         fn new() -> Self {
+            Self::new_opts(None)
+        }
+
+        fn new_slow() -> Self {
+            Self::new_opts(Some(Duration::from_millis(10)))
+        }
+
+        fn new_opts(slow: Option<Duration>) -> Self {
             let store = Store::default();
             let mut swarm = SwarmBuilder::with_new_identity()
                 .with_async_std()
@@ -921,7 +988,7 @@ mod tests {
                 .with_behaviour(|_| {
                     Bitswap::new(
                         BitswapConfig::new(),
-                        store.clone(),
+                        SlowStore(store.clone(), slow),
                         Box::new(|t| {
                             async_std::task::spawn(t);
                         }),
@@ -1056,7 +1123,7 @@ mod tests {
         let mut peer2 = Peer::new();
         peer2.add_address(&peer1);
 
-        let token = Token(0, vec![0].repeat(1024));
+        let token = Token(0, [0].repeat(1024));
 
         let block = create_block(ipld!(&b"hello world"[..]));
         peer1.store().insert(
@@ -1084,6 +1151,37 @@ mod tests {
             std::iter::empty(),
         );
         assert_complete_err(peer2.next().await, id);
+    }
+
+    #[async_std::test]
+    async fn test_bitswap_slow_insert() {
+        tracing_try_init();
+        let mut peer1 = Peer::new();
+        let mut peer2 = Peer::new_slow();
+        peer2.add_address(&peer1);
+
+        let block = create_block(ipld!(&b"hello world"[..]));
+        peer1
+            .store()
+            .insert(*block.cid(), block.data().to_vec().into());
+        let peer1 = peer1.spawn("peer1");
+
+        let id = peer2.swarm().behaviour_mut().get(
+            *block.cid(),
+            std::iter::once(peer1),
+            std::iter::empty(),
+        );
+
+        assert_complete_ok(peer2.next().await, id);
+
+        // ensure block is immediately available after query completes
+        let get_block = peer2.store().get(block.cid()).cloned();
+        assert_eq!(
+            &get_block
+                .expect("block to be available after query completes")
+                .0,
+            block.data()
+        );
     }
 
     #[async_std::test]
