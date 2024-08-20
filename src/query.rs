@@ -82,7 +82,7 @@ pub struct Header {
     /// Cid.
     pub cid: Cid,
     /// Timer.
-    pub timer: HistogramTimer,
+    pub _timer: HistogramTimer,
     /// Type.
     pub label: &'static str,
     /// Tokens.
@@ -159,7 +159,7 @@ impl QueryManager {
                 root,
                 parent,
                 cid,
-                timer,
+                _timer: timer,
                 label,
                 tokens,
             },
@@ -253,7 +253,7 @@ impl QueryManager {
                 root,
                 parent,
                 cid,
-                timer,
+                _timer: timer,
                 label: "get",
                 tokens,
             },
@@ -299,7 +299,7 @@ impl QueryManager {
                 root: id,
                 parent: None,
                 cid,
-                timer,
+                _timer: timer,
                 label: "sync",
                 tokens,
             },
